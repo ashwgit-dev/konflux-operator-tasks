@@ -141,6 +141,14 @@ spec:
         ocp_version_raw=$(get_ocp_version_from_fbc_fragment "$image_without_tag@$image_manifest_sha")
         echo "OCP versions from label: ${ocp_version_raw}"
 
+        # get_ocp_version_from_fbc_fragment only returns a JSON array when the
+        # 'com.redhat.fbc.openshift.version' label is present. If the label is missing, it falls
+        # back to a plain version string derived from the base image, which this binaryless task
+        # does not support.
+        if ! echo "${ocp_version_raw}" | jq -e 'type == "array"' >/dev/null 2>&1; then
+          fail FAILURE "Task $(context.task.name) failed: The 'com.redhat.fbc.openshift.version' label was not found on the FBC fragment (or does not contain a JSON array of versions). This task only supports binaryless FBC fragments that declare their target OCP versions via that label."
+        fi
+
         OCP_VERSIONS=$(echo "${ocp_version_raw}" | jq -r '.[]' | sed 's/^v//' | sort -V | uniq | xargs)
         if [[ -z "${OCP_VERSIONS}" ]]; then
           fail FAILURE "Task $(context.task.name) failed: Could not read any target OCP version from the 'com.redhat.fbc.openshift.version' label. This task only supports binaryless FBC fragments."

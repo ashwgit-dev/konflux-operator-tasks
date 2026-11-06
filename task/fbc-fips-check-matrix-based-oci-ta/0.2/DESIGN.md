@@ -1,214 +1,158 @@
-# Design Document: Binaryless Multi-Version FIPS Checking with Matrix Parallelism
+# Design: binaryless, multi-version FIPS matrix (0.2)
 
-| | |
-|---|---|
-| **Status** | Draft — for review |
-| **Area** | `task/fbc-fips-prepare-oci-ta` 0.2, `task/fbc-fips-check-matrix-based-oci-ta` 0.2 |
-| **Related** | `task/fbc-fips-check-oci-ta` 0.2 (standalone binaryless), `stepactions/fips-operator-check-step-action` 0.1 |
-| **Author** | — |
-| **Last updated** | 2026-11-02 |
+This document explains the main design changes in `fbc-fips-check-matrix-based-oci-ta`
+0.2 compared to 0.1, and the changes in its paired producer task
+`fbc-fips-prepare-oci-ta` 0.2 that drive them.
 
-## 1. Summary
+The two tasks are a pair and must move together:
 
-Binaryless FBC fragments target a **list** of OCP versions. FIPS scanning is **version-dependent** (`check-payload -V=<version>` applies a per-version exception list), so each image must be scanned once per targeted version. The current standalone task does this correctly but **sequentially in a single pod**, which is slow for fragments with many related images.
+- `fbc-fips-prepare-oci-ta` — extracts the relatedImages that need scanning and
+  writes them into bucket files + array results for matrix expansion (the producer).
+- `fbc-fips-check-matrix-based-oci-ta` — one matrix worker that scans a single
+  bucket with `check-payload` (the consumer).
 
-This design adds a **prepare + matrix** pair that keeps the correct per-version extraction but **fans the scanning out across many pods** using a **2-dimensional Tekton matrix** (`OCP_VERSION` × `BUCKET_INDEX`). Each matrix branch scans one bucket of images for exactly one OCP version, with the correct `-V`.
+## 1. The core change: 1-D matrix → 2-D matrix
 
-## 2. Background & current state
+### 0.1 model
 
-- **`fbc-fips-check-oci-ta` 0.2 (standalone, binaryless).** Reads the version list from the `com.redhat.fbc.openshift.version` label, resolves unreleased bundles per version, extracts `relatedImages` per version, and scans. Extraction is correct and uses a shared render cache (fragment rendered once; each unique bundle rendered once). Scanning is **in-pod** only.
-- **`fbc-fips-prepare-oci-ta` 0.1 + `fbc-fips-check-matrix-based-oci-ta` 0.1 (matrix family).** A single-OCP-version prepare/check pair: prepare extracts one flat image list and size-balances it into buckets; a 1-D matrix over `BUCKET_INDEX` scans the buckets in parallel. **Not version-aware.**
-- **`fips-operator-check-step-action` 0.1.** The scanner. Reads one `target_ocp_version.txt`, turns it into `-V=<version>`, and scans up to `MAX_PARALLEL` images concurrently in-pod. **Unchanged by this design.**
-
-The gap: the matrix family is single-version; the binaryless case is multi-version. This design closes that gap.
-
-## 3. Goals / Non-goals
-
-**Goals**
-- Correctly scan every `(image, version)` pair with that version's `-V`.
-- Parallelize scanning across pods (horizontal scale), not just within a pod.
-- Reuse the existing step action unchanged.
-- Keep the expensive extraction to a **single shared pass** (preserve the render cache).
-- Follow repo conventions (tests, CHANGELOG, README, version dirs).
-
-**Non-goals**
-- Changing the FIPS decision logic (subscription / `fips-compliant` / legacy-date exemption) — ported as-is.
-- Per-version attribution in failure *reporting* (see Open Questions).
-- Deprecating or modifying the standalone 0.2 task (tracked separately).
-
-## 4. Terminology
-
-- **Pod / TaskRun.** One run of a Tekton Task is one Kubernetes Pod with a fixed CPU/memory budget.
-- **In-pod parallelism.** Concurrency *inside* one pod (`MAX_PARALLEL` background scans sharing that pod's resources).
-- **Fan-out.** Tekton creating *many* pods (TaskRuns) that run in parallel across the cluster — here, via `matrix`.
-- **Scan unit.** A single `(image, version)` pair — the thing scanned with one `-V`.
-- **Bucket.** A file listing a subset of a version's images, assigned to one scan branch.
-- **Grid.** The cartesian set of `(version, bucket)` cells produced by the 2-D matrix.
-
-## 5. Constraints
-
-- **C1 — Multiple versions.** N target OCP versions per fragment (typically 1–6).
-- **C2 — Scan is version-dependent.** Same image digest may pass under one `-V` and fail under another ⇒ scan unit is `(image, version)`; **no dedupe across versions**.
-- **C3 — Extraction cache is per-process.** Fragment rendered once; each unique bundle rendered once; decisions/relatedImages are version-independent — cacheable only **within a single pod**. Splitting extraction across pods loses the cache.
-- **C4 — Scanning dominates cost** for large fragments; it is the parallelization target.
-- **C5 — Tekton cannot nest matrices.** A matrixed task cannot per-instance fan out another matrix.
-- **C6 — One `-V` per scan run.** The step action applies a single `target_ocp_version.txt` to all images in its run ⇒ a scan unit must be **version-homogeneous**.
-
-## 6. Chosen design (D3): shared prepare + 2-D cartesian matrix
-
-### 6.1 Architecture
+A binary-backed FBC fragment has **one** target OCP version. The prepare task
+derived that single version, extracted the unique relatedImages across the whole
+fragment, and distributed them into `N` buckets:
 
 ```
-            ┌──────────────────────────────────────────────────────────┐
-            │ fbc-fips-prepare-oci-ta (0.2)   — ONE pod                  │
-            │  1. read version list from label  -> 4.18 4.19 4.20 4.21   │
-            │  2. extract unreleased relatedImages PER VERSION           │
-            │     (shared fragment + per-bundle render cache)            │
-            │  3. size-balance each version's images into buckets        │
-            │  4. pad grid; write bucket-<v>-<i>.txt + metadata          │
-            │  results: OCP_VERSIONS, BUCKET_INDICES, BUCKETS_ARTIFACT,  │
-            │           TOTAL_IMAGES                                     │
-            └──────────────────────────────────────────────────────────┘
-                         │ matrix: OCP_VERSION[*] × BUCKET_INDEX[*]
-        ┌──────────┬──────────┬──────────┬───────────── … (versions × width pods)
-        ▼          ▼          ▼          ▼
-   check(4.18,0) check(4.18,1) check(4.19,0) …   — fbc-fips-check-matrix-based-oci-ta (0.2)
-        │  each: read bucket-<v>-<i>.txt; write target_ocp_version.txt=<v>
-        ▼
-   fips-operator-check-step-action  (scan images with -V=<v>, MAX_PARALLEL in-pod)
+bucket-0.txt, bucket-1.txt, ... bucket-<N-1>.txt
+target_ocp_version.txt          # one shared version for all buckets
 ```
 
-### 6.2 Task 1 — `fbc-fips-prepare-oci-ta` 0.2
+The pipeline fanned out a **1-dimensional** matrix over `BUCKET_INDEX` only. Every
+check worker read the single shared `target_ocp_version.txt` and scanned its bucket.
 
-**Step `get-unique-related-images`** (ported from standalone 0.2 extraction):
-- Read version list from `com.redhat.fbc.openshift.version`; validate `>= 4.15`.
-- Render fragment once; for each version resolve its index (with previous-version fallback), find unreleased bundles across all arches, decide SCAN/SKIP per bundle (cached), and collect SCAN bundles' `relatedImages` per version.
-- Output `related_images_by_version.json`: `{ "4.18": ["img@sha", ...], "4.19": [...] }`.
-- Also write `related-images-map.txt` (mirror map), `images_processed.txt`, and on failure `test_output.txt`.
+### 0.2 model
 
-**Step `split-into-buckets`** (new):
-- Read `related_images_by_version.json`; keep versions with ≥1 image.
-- For each version, size-balance (skopeo size, sort desc, greedy lightest-bucket) into `min(NUM_BUCKETS, images)` buckets → `bucket-<version>-<i>.txt`.
-- `grid_width = max` bucket count across versions; **pad** every version to `grid_width` with empty bucket files (so every cell has a file).
-- Copy metadata files (notably **not** a global `target_ocp_version.txt`).
-- Emit results.
+A **binaryless** FBC fragment declares a **list** of target OCP versions via the
+`com.redhat.fbc.openshift.version` label, e.g. `["v4.15","v4.16","v4.17"]`. Each
+targeted version must be scanned independently because `check-payload` applies a
+**per-OCP-version exception set** via `-V=<version>`. The same image under v4.15 and
+v4.17 is two distinct scans.
 
-**Step `create-buckets-artifact`:** push `/var/workdir/buckets` as the `BUCKETS_ARTIFACT` (unchanged from 0.1).
-
-**Params:** `SOURCE_ARTIFACT`, `image-digest`, `image-url`, `image-mirror-set-path`, `ociStorage`, `NUM_BUCKETS` (**per version** / grid width, default 1), `SIZE_FETCH_PARALLEL`.
-
-**Results:**
-
-| Result | Type | Example | Purpose |
-|---|---|---|---|
-| `OCP_VERSIONS` | array | `["4.18","4.19"]` | matrix dimension 1 |
-| `BUCKET_INDICES` | array | `["0","1"]` | matrix dimension 2 (grid width) |
-| `BUCKETS_ARTIFACT` | string | OCI ref | bucket files + metadata |
-| `TOTAL_IMAGES` | string | `"12"` | count of `(image,version)` pairs |
-
-### 6.3 Task 2 — `fbc-fips-check-matrix-based-oci-ta` 0.2
-
-- **New param `OCP_VERSION`** (plus existing `BUCKETS_ARTIFACT`, `BUCKET_INDEX`, `MAX_PARALLEL`).
-- `prepare-bucket-images` step:
-  - `bucket_file = bucket-${OCP_VERSION}-${BUCKET_INDEX}.txt`.
-  - Write `${OCP_VERSION}` to `target_ocp_version.txt` (so the step action gets the right `-V`).
-  - Copy metadata (`related-images-map.txt`, `images_processed.txt`, `test_output.txt`).
-  - If the bucket is empty/missing → **no-op success** (nothing written → step action skips).
-- `fips-operator-check-step-action` runs unchanged, using `-V=${OCP_VERSION}`.
-- `output-results` propagates `test_output.txt` errors from prepare, else the scan result (unchanged from 0.1).
-
-### 6.4 Matrix wiring (pipeline)
-
-```yaml
-- name: fbc-fips-prepare
-  taskRef: { name: fbc-fips-prepare-oci-ta }   # 0.2
-  params:
-    - { name: SOURCE_ARTIFACT, value: $(tasks.clone-repository.results.SOURCE_ARTIFACT) }
-    - { name: image-digest,    value: $(tasks.build-image-index.results.IMAGE_DIGEST) }
-    - { name: image-url,       value: $(tasks.build-image-index.results.IMAGE_URL) }
-    - { name: ociStorage,      value: $(params.output-image) }
-    - { name: NUM_BUCKETS,     value: "2" }
-
-- name: fbc-fips-check
-  runAfter: [fbc-fips-prepare]
-  matrix:
-    params:
-      - { name: OCP_VERSION,  value: $(tasks.fbc-fips-prepare.results.OCP_VERSIONS[*]) }
-      - { name: BUCKET_INDEX, value: $(tasks.fbc-fips-prepare.results.BUCKET_INDICES[*]) }
-  taskRef: { name: fbc-fips-check-matrix-based-oci-ta }   # 0.2
-  params:
-    - { name: BUCKETS_ARTIFACT, value: $(tasks.fbc-fips-prepare.results.BUCKETS_ARTIFACT) }
-    - { name: MAX_PARALLEL,     value: "2" }
-```
-
-### 6.5 Error propagation & edge cases
-
-- **Extraction failure** (render/label errors): prepare writes `test_output.txt` and emits a **minimal 1×1 grid** (`OCP_VERSIONS=["none"]`, `BUCKET_INDICES=["0"]`, empty `bucket-none-0.txt`). The single check branch propagates the error in `TEST_OUTPUT`.
-- **Nothing to scan** (no related images for any version): same minimal grid; the single branch no-ops to success.
-- **Empty padded cell**: bucket file exists but is empty → check branch no-ops to success.
-
-### 6.6 Parallelism & resources
-
-Two layers compound: **fan-out** (versions × width pods) × **in-pod** (`MAX_PARALLEL`). Because many pods run concurrently, `MAX_PARALLEL` defaults **lower** (2) than the standalone task (8) to avoid oversubscribing nodes.
-
-### 6.7 Worked example (4 versions, `NUM_BUCKETS=2`)
+So the unit of work is no longer a bucket — it is an **(OCP version, bucket) cell**.
+The prepare task now emits a per-version bucket grid:
 
 ```
-extraction: 4.18:[A,B,C]  4.19:[A,B,C]  4.20:[A,B,C]  4.21:[C,D]
-buckets:    4.18-0:[A,C] 4.18-1:[B]   ... 4.21-0:[C] 4.21-1:[D]
-grid width = 2
-OCP_VERSIONS = ["4.18","4.19","4.20","4.21"]   BUCKET_INDICES = ["0","1"]
-matrix -> 4 × 2 = 8 pods, each -V = its version
+bucket-<version>-<index>.txt    # e.g. bucket-4.15-0.txt, bucket-4.16-0.txt
 ```
 
-Note A is scanned under 4.18, 4.19, 4.20 (three scan units) — required by C2.
+and two array results instead of one, so the pipeline fans out a **2-dimensional**
+matrix `OCP_VERSION[*] × BUCKET_INDEX[*]`:
 
-## 7. Alternatives considered
+- `OCP_VERSIONS` — e.g. `["4.15","4.16","4.17"]`
+- `BUCKET_INDICES` — e.g. `["0","1"]` (the grid **width**)
 
-| Design | Partition | Max branches | Why not chosen |
-|---|---|---|---|
-| **D0 Standalone** | in-pod loop | 1 | no horizontal scaling; fine only for small fragments |
-| **D1 Version matrix** | per version | #versions | coarse — a big version is one slow branch |
-| **D2 Composite matrix** | per (version,bucket) | #real buckets | exact fan-out but needs composite-key parsing; kept as fallback for very uneven counts |
-| **D3 2-D matrix (chosen)** | per (version,bucket) | versions × width | clean native params + literal grid; cost = a few padded no-op branches |
-| D4 Nested matrix | — | — | **impossible** in Tekton (C5) |
-| D5 Flat union matrix | per image | #buckets | **incorrect** — breaks per-version `-V` (C2) |
-| D6 Dynamic fan-out (custom task) | arbitrary | arbitrary | needs custom controller/RBAC; overkill for small N |
+This is the central design shift. Everything below follows from it.
 
-All viable designs share the same extraction; they differ only in partition/fan-out, so switching later is localized to the bucketing/results step and matrix wiring.
+## 2. Changes to the check worker (`fbc-fips-check-matrix-based-oci-ta`)
 
-## 8. Correctness
+The worker is deliberately thin; most of the change is in the producer. Its diff:
 
-The only subtle correctness property is **C2**: because `check-payload -V` applies a per-version exception set, an image must be scanned under every version that lists it. The design preserves this by keying buckets on `(version, bucket)` and never deduping an image across versions. D5 (union) is rejected precisely because it violates this.
+| Concern | 0.1 | 0.2 |
+|---|---|---|
+| New param | — | `OCP_VERSION` (which version's bucket to scan; `"none"` for the fallback grid) |
+| `BUCKET_INDEX` meaning | which bucket | which bucket **within** the OCP version |
+| Bucket file read | `bucket-${BUCKET_INDEX}.txt` | `bucket-${OCP_VERSION}-${BUCKET_INDEX}.txt` |
+| Target OCP version | copied from the shared `target_ocp_version.txt` shipped by prepare | **written by the worker itself** from the `OCP_VERSION` param |
+| Log labels | `bucket N` | `OCP <v> bucket N` |
 
-## 9. Testing
+The key behavioral change: prepare 0.2 **no longer ships a shared
+`target_ocp_version.txt`**. Each worker owns its version and writes its own
+`target_ocp_version.txt` from the `OCP_VERSION` param, which
+`fips-operator-check-step-action` then passes to `check-payload` as `-V`.
 
-- **ShellSpec (unit).**
-  - prepare: `split-into-buckets` — per-version bucketing, grid padding, `(image,version)` totals, minimal-grid fallbacks. *(implemented, passing)*
-  - check: `prepare-bucket-images` — version→`-V`, bucket selection, empty/missing-cell no-op.
-- **Tekton integration.** A pipeline applying prepare + matrix check against a fixture fragment; assert fan-out shape and a success + an expected-failure case (`test/assert-task-failure`).
-- `bash -n` + Checkton + yamllint via CI.
+## 3. Changes to the producer (`fbc-fips-prepare-oci-ta`) that drive this
 
-## 10. Rollout, migration & consistency
+### 3.1 Version discovery is label-based, not base-image-derived
 
-- New **version dirs** (`0.2`) for both tasks; 0.1 untouched (per repo multi-version rules).
-- Both are **standalone OCI-TA** tasks (no `recipe.yaml`) — authored directly.
-- CHANGELOG + README for each 0.2.
-- Optional: `.tekton/*-v02-*` CI pipelines mirroring the v01 component pipelines.
-- Keep container image digests and shared params aligned with the 0.1 family and the standalone 0.2 (variant-consistency rules).
+0.2 reads the version **list** from the `com.redhat.fbc.openshift.version` label
+and fails fast with a clear message (rather than crashing on a `jq` parse error) if:
 
-## 11. Risks & mitigations
+- the label is missing / is not a JSON array — this task only supports binaryless
+  fragments (`get_ocp_version_from_fbc_fragment` returns a plain version string as a
+  fallback, which is now explicitly rejected), or
+- the minimum targeted version is `< v4.15` (binaryless is only permitted `>= v4.15`).
 
-| Risk | Mitigation |
-|---|---|
-| Padded empty branches waste TaskRuns | Small N; branches no-op fast. Fall back to D2 if it becomes material. |
-| Node oversubscription (many pods × MAX_PARALLEL) | Lower default `MAX_PARALLEL` (2); tune per cluster. |
-| Re-scanning shared images per version looks wasteful | Required by C2; document it. |
-| Extraction is a single point of failure | Error propagated via `test_output.txt` + minimal grid so the pipeline reports cleanly. |
+### 3.2 Render once, attribute per version
 
-## 12. Open questions
+Work that is version-independent is done **once** and reused across all versions to
+avoid redundant renders:
 
-1. Expected N (versions) and images-per-version? (D2 vs D3; `NUM_BUCKETS` default.)
-2. `NUM_BUCKETS` = per-version grid width (current) or global budget?
-3. Do failures need per-version attribution, or is per-image sufficient?
-4. Fix standalone D0 independently, or steer users to the matrix variant?
+- the fragment's per-arch digests,
+- the fragment render + its package list,
+- each **bundle's** SCAN/SKIP decision and its extracted relatedImages
+  (memoized in `bundle_scan_decision_map` / `bundle_related_images_map`).
+
+Work that **is** version-specific is done per version:
+
+- resolving that version's target index
+  (`registry.redhat.io/.../redhat-operator-index:v<version>`, with the
+  `get_prev_ocp_version` fallback when the fragment has packages not yet released in
+  that version's index),
+- finding the unreleased bundles against that index,
+- attributing the surviving relatedImages to that version
+  (`ocp_version_related_images_map[version]`).
+
+The result is serialized to a single document the splitter consumes:
+
+```json
+{ "4.15": ["img@sha", ...], "4.16": [...] }   # related_images_by_version.json
+```
+
+The **dedupe key is `(image, version)`**, not `image`. The same image can legitimately
+appear under several versions. `TOTAL_IMAGES` now counts `(image, version)` pairs.
+
+> Note: the `createdAt`-based legacy FIPS exemption (bundles created before the
+> 2025-01-31 cutoff with a qualifying subscription are exempt unless they claim
+> `fips-compliant=true`) now lives in prepare's per-bundle decision. This mirrors
+> the logic already present in the standalone `fbc-fips-check` family and keeps the
+> SCAN/SKIP decision in one place.
+
+### 3.3 Per-version bucketing with a uniform grid width
+
+Each version's images are size-fetched and load-balanced into buckets with the same
+greedy "assign to lightest bucket" algorithm as 0.1, but now:
+
+- `NUM_BUCKETS` means buckets **per OCP version** (the grid width target),
+- each version computes `actual_buckets = max(1, min(NUM_BUCKETS, num_images))`,
+- the grid is padded to the **widest** version so every `(version, index)` cell has a
+  file; empty padded cells are a harmless no-op in the worker.
+
+A rectangular grid is required because a Tekton matrix is a Cartesian product
+`OCP_VERSION[*] × BUCKET_INDEX[*]` — every version must have a file at every index.
+
+### 3.4 The "always run one worker" fallback
+
+0.1 always launched at least one worker (even with no images) so that an error from
+prepare — propagated via `test_output.txt` in the bucket artifact — still surfaces.
+
+0.2 preserves this with a **minimal 1×1 grid**: it emits `OCP_VERSIONS=["none"]`,
+`BUCKET_INDICES=["0"]`, and an empty `bucket-none-0.txt`. This is why the worker's
+`OCP_VERSION` param documents `"none"` as a valid value. A single worker runs, copies
+`test_output.txt`, and either propagates the error or no-ops.
+
+## 4. Contract summary (what the pipeline wires together)
+
+| | 0.1 | 0.2 |
+|---|---|---|
+| Matrix dimensions | `BUCKET_INDEX` | `OCP_VERSION` × `BUCKET_INDEX` |
+| prepare results | `BUCKET_INDICES`, `TOTAL_IMAGES` | `OCP_VERSIONS`, `BUCKET_INDICES`, `TOTAL_IMAGES` |
+| bucket files | `bucket-<i>.txt` | `bucket-<version>-<i>.txt` |
+| target version source | shared `target_ocp_version.txt` from prepare | each worker writes its own from `OCP_VERSION` |
+| dedupe key | `image` | `(image, version)` |
+| `NUM_BUCKETS` | total buckets | buckets per version (grid width) |
+| supported fragments | binary-backed (single version) | binaryless (version list, `>= v4.15`) |
+
+## 5. Why not keep it 1-D?
+
+Collapsing all versions into one bucket set would force a single `-V` value and lose
+the per-version `check-payload` exception sets, producing both false positives and
+false negatives. Running the versions sequentially inside one task would serialize
+what is naturally parallel work. Expanding the matrix to two dimensions keeps each
+scan correct (correct `-V`) and fully parallel across both versions and buckets.

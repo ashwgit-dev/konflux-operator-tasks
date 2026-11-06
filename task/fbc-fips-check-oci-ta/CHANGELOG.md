@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2
+
+### Added
+
+- Binaryless, multi-version variant of `fbc-fips-check-oci-ta`. Reads the **list** of target OCP versions from the `com.redhat.fbc.openshift.version` label and extracts/scans unreleased relatedImages **per version**, sharing the fragment render and per-bundle render across all versions. Binaryless FBC fragments are only permitted for OCP versions >= v4.15.
+
+### Fixed
+
+- Fail with a clear error instead of crashing on a `jq` parse error when `get_ocp_version_from_fbc_fragment` falls back to a plain version string (returned when the `com.redhat.fbc.openshift.version` label is missing) instead of the expected JSON array.
+
 ## Unreleased
 
 ### Fixed
